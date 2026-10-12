@@ -7,6 +7,7 @@ Run `dmsmid.exe` and pick one or more files in the dialog. Each file is identifi
 ```
 dmsmid song.mid other.dms
 dmsmid --module "C:\...\Domino64Bit\Module\ok_XG2k.xml" song.mid
+dmsmid --vel0 silent song.mid
 ```
 
 ## Behaviour (matches Domino's own import/export; see tests/domino.rs)
@@ -18,6 +19,18 @@ dmsmid --module "C:\...\Domino64Bit\Module\ok_XG2k.xml" song.mid
   - **.dms → MIDI:** Domino-only events (Measure Link, Variables, Chord, Scale) and system exclusive.
   - **MIDI → .dms:** meta events Domino has no place for (sequence number, SMPTE offset, instrument/program/device name, sequencer-specific), sysex, and poly aftertouch if the module has no `@PKP` macro.
   - Each conversion prints what it dropped.
+
+## Velocity-0 note-ons
+
+The MIDI standard treats a note-on with velocity 0 as a note-off, and so does Domino. Some black MIDI tools instead write *silent notes*: a velocity-0 note-on followed by its own explicit note-off. Read the standard way, such a file loses those notes, gives the audible ones zero length, and reports millions of unmatched note-offs.
+
+When a MIDI file contains velocity-0 note-ons and the two readings disagree, dmsmid asks which one you want before converting, and shows how many notes each would leave unpaired:
+
+1. **note-off** (default): the MIDI standard and Domino's behaviour.
+2. **silent note**: the note-on starts a silent note that ends at its own note-off.
+3. **auto**: whichever reading fits better, decided per track.
+
+`--vel0 note-off|silent|auto` answers the question in advance. Ordinary files, where both readings agree, are never asked about. Silent notes keep velocity 0 in the `.dms`, and converting back writes them the same way, so a round trip preserves them.
 
 ## Performance
 

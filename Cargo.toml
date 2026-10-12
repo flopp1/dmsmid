@@ -1,6 +1,7 @@
 [package]
 name = "dmsmid"
-version = "0.1.0"
+version = "0.2.0"
+license = "MIT"
 edition = "2021"
 description = "Convert Domino .dms projects to Standard MIDI Files and back"
 

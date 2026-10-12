@@ -1,10 +1,15 @@
 //! Streaming building blocks with bounded memory:
 //! - [`Inflater`]: zlib decompression on a background thread, read through [`BlockSource`];
-//! - [`compress_parallel`]: pigz-style parallel zlib compression with in-order output.
+//! - [`compress_parallel`]: pigz-style parallel zlib compression with in-order output,
+//!   plus out-of-order [`Segment`]s spliced in later.
 
 use anyhow::{anyhow, bail, Result};
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
-use std::io::Write;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::Mutex;
 
@@ -135,65 +140,200 @@ impl BlockSource {
 // Compression
 
 struct Job {
+    stream: u32,
     idx: u64,
     data: Vec<u8>,
     dict: Vec<u8>,
     last: bool,
 }
 
-struct Done {
-    idx: u64,
-    data: Result<Vec<u8>>,
-    adler: u32,
-    len: u64,
+/// Messages to the writer thread.
+enum Msg {
+    Block { stream: u32, idx: u64, data: Result<Vec<u8>>, adler: u32, len: u64 },
+    /// Segment `stream` is complete after `blocks` blocks.
+    SegEnd { stream: u32, blocks: u64 },
+    /// Insert these segments into the main stream before its block `at`.
+    Splice { at: u64, segs: Vec<u32> },
 }
 
-/// The `Write` end of [`compress_parallel`]: cuts the stream into blocks and hands them out.
-pub struct ParSink {
+/// A run of uncompressed data cut into blocks; each block's dictionary is the
+/// previous 32 KB of the same run.
+struct Run {
+    id: u32,
     cur: Vec<u8>,
-    block: usize,
     idx: u64,
+    dict: Vec<u8>,
+}
+
+impl Run {
+    fn new(id: u32, block: usize) -> Self {
+        Run { id, cur: Vec::with_capacity(block), idx: 0, dict: Vec::new() }
+    }
+}
+
+/// A stretch of output that is written out of order and spliced into the main
+/// stream later (see [`ParSink::splice`]). It is compressed like the main stream;
+/// its compressed blocks wait in a temporary file, so memory stays bounded.
+pub struct Segment(Run);
+
+struct Shared {
     jobs: SyncSender<Job>,
     permits: Receiver<()>,
-    dict: Vec<u8>,
-    pub total: u64,
+    block: usize,
 }
 
-impl ParSink {
-    fn send(&mut self, last: bool) -> std::io::Result<()> {
-        let data = std::mem::replace(&mut self.cur, Vec::with_capacity(self.block));
-        // This block's dictionary is the last 32 KB of everything before it.
-        let job_dict = std::mem::take(&mut self.dict);
+impl Shared {
+    fn send(&self, run: &mut Run, last: bool) -> std::io::Result<()> {
+        let data = std::mem::replace(&mut run.cur, Vec::with_capacity(self.block));
+        // This block's dictionary is the last 32 KB of the run before it.
+        let job_dict = std::mem::take(&mut run.dict);
         let tail = &data[data.len().saturating_sub(DICT)..];
         let mut next = Vec::with_capacity(DICT);
         let keep = DICT - tail.len();
         next.extend_from_slice(&job_dict[job_dict.len().saturating_sub(keep)..]);
         next.extend_from_slice(tail);
-        self.dict = next;
+        run.dict = next;
         let broken = || std::io::Error::other("compression worker stopped");
         self.permits.recv().map_err(|_| broken())?;
-        self.jobs.send(Job { idx: self.idx, data, dict: job_dict, last }).map_err(|_| broken())?;
-        self.idx += 1;
+        self.jobs.send(Job { stream: run.id, idx: run.idx, data, dict: job_dict, last }).map_err(|_| broken())?;
+        run.idx += 1;
+        Ok(())
+    }
+
+    fn write(&self, run: &mut Run, mut buf: &[u8]) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            let k = (self.block - run.cur.len()).min(buf.len());
+            run.cur.extend_from_slice(&buf[..k]);
+            buf = &buf[k..];
+            if run.cur.len() == self.block {
+                self.send(run, false)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The `Write` end of [`compress_parallel`]: cuts the stream into blocks and hands them out.
+pub struct ParSink {
+    shared: Shared,
+    main: Run,
+    msgs: SyncSender<Msg>,
+    next_id: u32,
+    /// Uncompressed bytes written so far, segments included.
+    pub total: u64,
+}
+
+impl ParSink {
+    /// Start a segment, to be filled with [`ParSink::write_segment`].
+    pub fn segment(&mut self) -> Segment {
+        self.next_id += 1;
+        Segment(Run::new(self.next_id, self.shared.block))
+    }
+
+    pub fn write_segment(&mut self, seg: &mut Segment, buf: &[u8]) -> std::io::Result<()> {
+        self.total += buf.len() as u64;
+        self.shared.write(&mut seg.0, buf)
+    }
+
+    /// Place `segs`, in order, after everything written to the main stream so far.
+    pub fn splice(&mut self, segs: Vec<Segment>) -> std::io::Result<()> {
+        if segs.is_empty() {
+            return Ok(());
+        }
+        let broken = || std::io::Error::other("compression writer stopped");
+        if !self.main.cur.is_empty() {
+            self.shared.send(&mut self.main, false)?;
+        }
+        let mut ids = Vec::with_capacity(segs.len());
+        for mut s in segs {
+            if !s.0.cur.is_empty() {
+                self.shared.send(&mut s.0, false)?;
+            }
+            self.msgs.send(Msg::SegEnd { stream: s.0.id, blocks: s.0.idx }).map_err(|_| broken())?;
+            ids.push(s.0.id);
+        }
+        self.msgs.send(Msg::Splice { at: self.main.idx, segs: ids }).map_err(|_| broken())?;
+        // What now precedes the main stream is the last segment, not the old main
+        // tail, so the next main block must not refer back into it.
+        self.main.dict.clear();
         Ok(())
     }
 }
 
 impl Write for ParSink {
-    fn write(&mut self, mut buf: &[u8]) -> std::io::Result<usize> {
-        let n = buf.len();
-        self.total += n as u64;
-        while !buf.is_empty() {
-            let k = (self.block - self.cur.len()).min(buf.len());
-            self.cur.extend_from_slice(&buf[..k]);
-            buf = &buf[k..];
-            if self.cur.len() == self.block {
-                self.send(false)?;
-            }
-        }
-        Ok(n)
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.total += buf.len() as u64;
+        self.shared.write(&mut self.main, buf)?;
+        Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Ordered output of one stream: compressed blocks waiting for their turn.
+struct Ordered {
+    pending: BTreeMap<u64, (Vec<u8>, u32, u64)>,
+    next: u64,
+    adler: u32,
+    len: u64,
+}
+
+impl Ordered {
+    fn new() -> Self {
+        Ordered { pending: BTreeMap::new(), next: 0, adler: 1, len: 0 }
+    }
+
+    /// Write the blocks that are next in order; returns how many were written.
+    fn drain(&mut self, out: &mut impl Write) -> std::io::Result<usize> {
+        let mut n = 0;
+        while let Some((data, adler, len)) = self.pending.remove(&self.next) {
+            out.write_all(&data)?;
+            self.adler = adler32_combine(self.adler, adler, len);
+            self.len += len;
+            self.next += 1;
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+/// A segment's compressed blocks, spooled to a temporary file until spliced.
+struct Spool {
+    blocks: Ordered,
+    file: Option<File>,
+    path: PathBuf,
+    end: Option<u64>,
+}
+
+impl Spool {
+    fn new(id: u32) -> Self {
+        static RUN: AtomicU64 = AtomicU64::new(0);
+        let n = RUN.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("dmsmid-{}-{n}-{id}.tmp", std::process::id()));
+        Spool { blocks: Ordered::new(), file: None, path, end: None }
+    }
+
+    fn drain(&mut self) -> std::io::Result<usize> {
+        if self.blocks.pending.contains_key(&self.blocks.next) && self.file.is_none() {
+            self.file = Some(File::options().read(true).write(true).create_new(true).open(&self.path)?);
+        }
+        match &mut self.file {
+            Some(f) => self.blocks.drain(f),
+            None => Ok(0),
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.end == Some(self.blocks.next)
+    }
+}
+
+impl Drop for Spool {
+    fn drop(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -211,7 +351,7 @@ pub fn compress_parallel<W: Write + Send>(
     let in_flight = 2 * workers + 2;
     let (job_tx, job_rx) = sync_channel::<Job>(in_flight);
     let job_rx = Mutex::new(job_rx);
-    let (done_tx, done_rx) = sync_channel::<Done>(in_flight);
+    let (msg_tx, msg_rx) = sync_channel::<Msg>(in_flight);
     let (permit_tx, permit_rx) = sync_channel::<()>(in_flight);
     for _ in 0..in_flight {
         permit_tx.send(()).unwrap();
@@ -219,7 +359,7 @@ pub fn compress_parallel<W: Write + Send>(
 
     std::thread::scope(|s| {
         for _ in 0..workers {
-            let done_tx = done_tx.clone();
+            let msg_tx = msg_tx.clone();
             let job_rx = &job_rx;
             s.spawn(move || loop {
                 let job = match job_rx.lock().unwrap().recv() {
@@ -227,50 +367,101 @@ pub fn compress_parallel<W: Write + Send>(
                     Err(_) => return,
                 };
                 let data = deflate_block(&job.data, &job.dict, job.last, level);
-                let done = Done { idx: job.idx, data, adler: adler32(&job.data), len: job.data.len() as u64 };
-                if done_tx.send(done).is_err() {
+                let msg = Msg::Block {
+                    stream: job.stream,
+                    idx: job.idx,
+                    data,
+                    adler: adler32(&job.data),
+                    len: job.data.len() as u64,
+                };
+                if msg_tx.send(msg).is_err() {
                     return;
                 }
             });
         }
-        drop(done_tx);
 
         let writer = s.spawn(move || -> Result<(W, u64)> {
             out.write_all(header)?;
             out.write_all(&[0x78, 0x9C])?;
-            let mut pending = std::collections::BTreeMap::new();
-            let mut next = 0u64;
-            let mut adler = 1u32;
-            let mut total = 0u64;
-            for d in done_rx {
-                pending.insert(d.idx, d);
-                while let Some(d) = pending.remove(&next) {
-                    out.write_all(&d.data?)?;
-                    adler = adler32_combine(adler, d.adler, d.len);
-                    total += d.len;
-                    next += 1;
+            let mut main = Ordered::new();
+            let mut spools: HashMap<u32, Spool> = HashMap::new();
+            let mut splices: VecDeque<(u64, Vec<u32>)> = VecDeque::new();
+            let release = |n: usize| {
+                for _ in 0..n {
                     let _ = permit_tx.send(());
                 }
+            };
+            for msg in msg_rx {
+                match msg {
+                    Msg::Block { stream, idx, data, adler, len } => {
+                        let blocks = match stream {
+                            0 => &mut main,
+                            s => &mut spools.entry(s).or_insert_with(|| Spool::new(s)).blocks,
+                        };
+                        blocks.pending.insert(idx, (data?, adler, len));
+                    }
+                    Msg::SegEnd { stream, blocks } => {
+                        spools.entry(stream).or_insert_with(|| Spool::new(stream)).end = Some(blocks);
+                    }
+                    Msg::Splice { at, segs } => splices.push_back((at, segs)),
+                }
+                for sp in spools.values_mut() {
+                    release(sp.drain()?);
+                }
+                loop {
+                    if let Some((at, ids)) = splices.front() {
+                        if *at == main.next {
+                            if !ids.iter().all(|id| spools.get(id).is_some_and(Spool::complete)) {
+                                break; // wait for the segments to finish
+                            }
+                            let (_, ids) = splices.pop_front().unwrap();
+                            for id in ids {
+                                let mut sp = spools.remove(&id).unwrap();
+                                if let Some(f) = &mut sp.file {
+                                    f.seek(SeekFrom::Start(0))?;
+                                    std::io::copy(f, &mut out)?;
+                                }
+                                main.adler = adler32_combine(main.adler, sp.blocks.adler, sp.blocks.len);
+                                main.len += sp.blocks.len;
+                            }
+                            continue;
+                        }
+                    }
+                    // Main blocks up to the next splice point.
+                    let limit = splices.front().map_or(u64::MAX, |s| s.0);
+                    match main.pending.first_key_value() {
+                        Some((&k, _)) if k == main.next && k < limit => {
+                            let (data, adler, len) = main.pending.remove(&k).unwrap();
+                            out.write_all(&data)?;
+                            main.adler = adler32_combine(main.adler, adler, len);
+                            main.len += len;
+                            main.next += 1;
+                            release(1);
+                        }
+                        _ => break,
+                    }
+                }
             }
-            if !pending.is_empty() {
+            if !main.pending.is_empty() || !splices.is_empty() || !spools.is_empty() {
                 bail!("compression stopped early");
             }
-            out.write_all(&adler.to_be_bytes())?;
+            out.write_all(&main.adler.to_be_bytes())?;
             out.flush()?;
-            Ok((out, total))
+            Ok((out, main.len))
         });
 
         let mut sink = ParSink {
-            cur: Vec::with_capacity(block),
-            block,
-            idx: 0,
-            jobs: job_tx,
-            permits: permit_rx,
-            dict: Vec::new(),
+            shared: Shared { jobs: job_tx, permits: permit_rx, block },
+            main: Run::new(0, block),
+            msgs: msg_tx,
+            next_id: 0,
             total: 0,
         };
-        let produced = produce(&mut sink).and_then(|()| Ok(sink.send(true)?));
-        drop(sink); // closes the job queue, so workers and writer finish
+        let produced = produce(&mut sink).and_then(|()| {
+            let s = &mut sink;
+            Ok(s.shared.send(&mut s.main, true)?)
+        });
+        drop(sink); // closes the job queue and the sink's message sender
         let written = writer.join().map_err(|_| anyhow!("writer thread panicked"))?;
         produced?;
         written
@@ -349,6 +540,30 @@ mod tests {
         let mut back = Vec::new();
         flate2::read::ZlibDecoder::new(&out[3..]).read_to_end(&mut back).unwrap();
         assert_eq!(back, data);
+    }
+
+    #[test]
+    fn segments_are_spliced_in_order() {
+        let part = |c: u8, n: usize| -> Vec<u8> { (0..n).map(|i| c.wrapping_add((i % 7) as u8)).collect() };
+        let (a, b, c, d) = (part(b'a', 5000), part(b'b', 7777), part(b'c', 123), part(b'd', 4000));
+        let (out, n) = compress_parallel(Vec::new(), b"", Compression::default(), 1000, |w| {
+            // Interleave writes to the main stream and two segments, plus an empty one.
+            let (mut s1, mut s2, s3) = (w.segment(), w.segment(), w.segment());
+            w.write_all(&a[..2500])?;
+            w.write_segment(&mut s2, &c)?;
+            w.write_segment(&mut s1, &b[..3000])?;
+            w.write_all(&a[2500..])?;
+            w.write_segment(&mut s1, &b[3000..])?;
+            w.splice(vec![s1, s2, s3])?;
+            w.write_all(&d)?;
+            Ok(())
+        })
+        .unwrap();
+        let want = [a, b, c, d].concat();
+        assert_eq!(n, want.len() as u64);
+        let mut back = Vec::new();
+        flate2::read::ZlibDecoder::new(&out[..]).read_to_end(&mut back).unwrap();
+        assert_eq!(back, want);
     }
 
     #[test]

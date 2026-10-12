@@ -29,20 +29,55 @@ use std::sync::Mutex;
 
 const MAX_GATE: u64 = 65535; // Domino caps note length on import
 
+/// How to read a note-on with velocity 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Vel0 {
+    /// A note-off, as the MIDI standard says (and as Domino imports it).
+    #[default]
+    NoteOff,
+    /// A silent note that ends at its own later note-off. Some black MIDI tools
+    /// write notes this way: every note-on, whatever its velocity, has its own `8n`.
+    SilentNote,
+    /// Per output track, whichever of the two leaves fewer notes unpaired.
+    Auto,
+}
+
+/// What the two readings of velocity-0 note-ons would give, for choosing one.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Vel0Summary {
+    /// Velocity-0 note-ons in the file.
+    pub vel0_note_ons: usize,
+    /// Note-offs without a note and notes without a note-off, under each reading.
+    pub unpaired_as_note_off: usize,
+    pub unpaired_as_silent_note: usize,
+    /// Output tracks where the silent-note reading pairs better.
+    pub tracks_better_as_silent: usize,
+}
+
+impl Vel0Summary {
+    /// True when the readings disagree somewhere, i.e. the choice changes the result
+    /// beyond turning ordinary velocity-0 note-offs into notes.
+    pub fn ambiguous(&self) -> bool {
+        self.tracks_better_as_silent > 0
+    }
+}
+
 /// What one channel message becomes.
 enum Midi {
     NoteOn { key: u8, vel: u8 },
-    NoteOff { key: u8 },
+    NoteOff,
     Control { id: u16, gate: i32, value: i32 },
     Program(u8),
     Dropped(String),
 }
 
+/// `vel0_notes`: a velocity-0 note-on starts a (silent) note that ends at its own
+/// note-off, instead of being a note-off itself (see [`Pairing`]).
 #[inline]
-fn midi(st: u8, d1: u8, d2: u8, module: &Module) -> Midi {
+fn midi(st: u8, d1: u8, d2: u8, module: &Module, vel0_notes: bool) -> Midi {
     match st & 0xF0 {
-        0x90 if d2 > 0 => Midi::NoteOn { key: d1, vel: d2 },
-        0x80 | 0x90 => Midi::NoteOff { key: d1 },
+        0x90 if d2 > 0 || vel0_notes => Midi::NoteOn { key: d1, vel: d2 },
+        0x80 | 0x90 => Midi::NoteOff,
         0xA0 => match module.poly_pressure() {
             Some(c) => Midi::Control { id: c.id, gate: d1 as i32 - c.gate_offset, value: d2 as i32 - c.value_offset },
             None => Midi::Dropped(format!(
@@ -94,9 +129,101 @@ fn tick32(t: u64) -> Result<u32> {
 struct OutScan {
     ch: u8,
     notes: usize,
+    /// Velocity-0 note-ons are silent notes, not note-offs (decided after pass 1).
+    vel0_notes: bool,
     events_len: u64,
     last_tick: u64,
     end: u64,
+    /// End of the track before notes are counted (FF 2F or the last other event).
+    base_end: u64,
+    /// Note pairing as [note-off reading, silent-note reading].
+    readings: [PairStats; 2],
+}
+
+/// The outcome of a [`Pairing`].
+#[derive(Clone, Copy, Debug, Default)]
+struct PairStats {
+    notes: usize,
+    silent: usize,
+    unmatched_offs: usize,
+    unclosed: usize,
+    long: usize,
+    last_on: u64,
+}
+
+impl PairStats {
+    fn unpaired(&self) -> usize {
+        self.unmatched_offs + self.unclosed
+    }
+}
+
+/// Simulates note pairing under one reading of velocity-0 note-ons:
+/// - spec: a velocity-0 note-on is a note-off (what Domino does);
+/// - silent notes: a velocity-0 note-on starts a silent note that ends at a
+///   later explicit note-off. Black MIDI tools write notes this way, pairing
+///   every note-on, whatever its velocity, with its own `8n` note-off.
+///
+/// Pass 1 runs both; the reading is chosen afterwards (see [`Vel0`]).
+struct Pairing {
+    vel0_notes: bool,
+    open: Vec<VecDeque<u64>>, // per key: start ticks of sounding notes, oldest first
+    notes: usize,
+    silent: usize,
+    unmatched_offs: usize,
+    unclosed: usize,
+    long: usize,
+    last_on: u64,
+}
+
+impl Pairing {
+    fn new(vel0_notes: bool) -> Self {
+        Pairing {
+            vel0_notes,
+            open: vec![VecDeque::new(); 128],
+            notes: 0,
+            silent: 0,
+            unmatched_offs: 0,
+            unclosed: 0,
+            long: 0,
+            last_on: 0,
+        }
+    }
+
+    #[inline]
+    fn event(&mut self, kind: u8, key: u8, vel: u8, tick: u64) {
+        let k = key as usize & 0x7F;
+        if kind == 0x90 && (vel > 0 || self.vel0_notes) {
+            self.open[k].push_back(tick);
+            self.notes += 1;
+            self.silent += (vel == 0) as usize;
+            self.last_on = tick;
+        } else {
+            match self.open[k].pop_front() {
+                Some(on) if tick - on > MAX_GATE => self.long += 1,
+                Some(_) => {}
+                None => self.unmatched_offs += 1,
+            }
+        }
+    }
+
+    /// Close notes still sounding at the end of the track.
+    fn finish(mut self, base_end: u64) -> PairStats {
+        let end = base_end.max(self.last_on);
+        for on in self.open.iter().flatten() {
+            self.unclosed += 1;
+            if end - on > MAX_GATE {
+                self.long += 1;
+            }
+        }
+        PairStats {
+            notes: self.notes,
+            silent: self.silent,
+            unmatched_offs: self.unmatched_offs,
+            unclosed: self.unclosed,
+            long: self.long,
+            last_on: self.last_on,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -138,8 +265,8 @@ fn scan_conductor(track: &[u8]) -> Result<Scan> {
 fn scan_track(ti: u32, track: &[u8], module: &Module) -> Result<Scan> {
     let mut s = Scan::default();
     let mut buf = Vec::new();
-    // Per output: per key, the start ticks of sounding notes.
-    let mut open: Vec<Vec<VecDeque<u64>>> = Vec::new();
+    // Per output: note pairing under both readings of velocity-0 note-ons.
+    let mut pairs: Vec<[Pairing; 2]> = Vec::new();
     let mut slot = [u8::MAX; 16]; // channel → output index
     // Meta events go to the first output, which may not be known yet.
     let (mut extra_len, mut extra_last) = (0u64, 0u64);
@@ -153,25 +280,19 @@ fn scan_track(ti: u32, track: &[u8], module: &Module) -> Result<Scan> {
                 if slot[ch as usize] == u8::MAX {
                     slot[ch as usize] = s.outs.len() as u8;
                     s.outs.push(OutScan { ch, ..Default::default() });
-                    open.push(vec![VecDeque::new(); 128]);
+                    pairs.push([Pairing::new(false), Pairing::new(true)]);
                 }
                 let o = slot[ch as usize] as usize;
-                let len = match midi(st, d1, d2, module) {
-                    Midi::NoteOn { key, .. } => {
-                        open[o][key as usize & 0x7F].push_back(tick);
-                        s.outs[o].notes += 1;
-                        NOTE_LEN
+                let kind = st & 0xF0;
+                if kind == 0x80 || kind == 0x90 {
+                    tick32(tick)?;
+                    for p in &mut pairs[o] {
+                        p.event(kind, d1, d2, tick);
                     }
-                    Midi::NoteOff { key } => {
-                        match open[o][key as usize & 0x7F].pop_front() {
-                            Some(on) if tick - on > MAX_GATE => {
-                                s.report.warn("note longer than 65535 ticks (shortened, as Domino does)")
-                            }
-                            Some(_) => {}
-                            None => s.report.warn("note-off without a matching note-on (ignored)"),
-                        }
-                        continue;
-                    }
+                    continue;
+                }
+                let len = match midi(st, d1, d2, module, false) {
+                    Midi::NoteOn { .. } | Midi::NoteOff => unreachable!(),
                     Midi::Control { .. } => CONTROL_LEN,
                     Midi::Program(_) => PROGRAM_LEN,
                     Midi::Dropped(w) => {
@@ -219,22 +340,16 @@ fn scan_track(ti: u32, track: &[u8], module: &Module) -> Result<Scan> {
     }
     if s.outs.is_empty() {
         s.outs.push(OutScan { ch: prefix.unwrap_or(0), ..Default::default() });
-        open.push(vec![VecDeque::new(); 128]);
+        pairs.push([Pairing::new(false), Pairing::new(true)]);
     }
     if s.outs.len() > 1 {
         s.report.warn("MIDI track with several channels (split into one Domino track per channel)");
     }
     s.outs[0].events_len += extra_len;
     s.outs[0].last_tick = s.outs[0].last_tick.max(extra_last);
-    for (o, keys) in s.outs.iter_mut().zip(&open) {
-        o.end = s.end.max(o.last_tick);
-        tick32(o.end)?;
-        for on in keys.iter().flatten() {
-            s.report.warn("note without a note-off (ended at the end of its track)");
-            if o.end - on > MAX_GATE {
-                s.report.warn("note longer than 65535 ticks (shortened, as Domino does)");
-            }
-        }
+    for (o, [spec, silent]) in s.outs.iter_mut().zip(pairs) {
+        o.base_end = s.end.max(o.last_tick);
+        o.readings = [spec.finish(o.base_end), silent.finish(o.base_end)];
     }
     Ok(s)
 }
@@ -258,22 +373,46 @@ fn par_map<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     results.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect()
 }
 
+/// Apply the chosen reading of velocity-0 note-ons to one output track.
+fn finalize(o: &mut OutScan, vel0: Vel0, report: &mut Report) -> Result<()> {
+    let [spec, silent] = o.readings;
+    o.vel0_notes = match vel0 {
+        Vel0::NoteOff => false,
+        Vel0::SilentNote => silent.silent > 0,
+        Vel0::Auto => silent.silent > 0 && silent.unpaired() < spec.unpaired(),
+    };
+    let p = if o.vel0_notes { silent } else { spec };
+    o.last_tick = o.last_tick.max(p.last_on);
+    o.end = o.base_end.max(p.last_on);
+    tick32(o.end)?;
+    o.notes = p.notes;
+    o.events_len += (p.notes * NOTE_LEN) as u64;
+    report.warn_n("note-off without a matching note-on (ignored)", p.unmatched_offs);
+    report.warn_n("note without a note-off (ended at the end of its track)", p.unclosed);
+    report.warn_n("note longer than 65535 ticks (shortened, as Domino does)", p.long);
+    if o.vel0_notes {
+        report.warn_n("velocity-0 note-on read as a silent note", p.silent);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Pass 2: generate
 
-/// Second cursor over a track that finds note-offs ahead of the writer.
-/// Pairing is first-in-first-out per key, exactly as in pass 1.
+/// Second cursor over a track that finds note-offs ahead of the writer, for every
+/// channel of the track at once. Pairing is first-in-first-out per (channel, key),
+/// exactly as in pass 1.
 struct Lookahead<'a> {
     it: Events<'a>,
-    ch: u8,
+    vel0_notes: [bool; 16],
     idx: u64,
-    open: [u32; 128],
-    offs: Vec<VecDeque<u64>>,
+    open: Vec<u32>,              // per channel × key
+    offs: Vec<VecDeque<u64>>,    // per channel × key: note-off ticks found ahead
 }
 
 impl<'a> Lookahead<'a> {
-    fn new(track: &'a [u8], ch: u8) -> Self {
-        Lookahead { it: smf::events(track), ch, idx: 0, open: [0; 128], offs: vec![VecDeque::new(); 128] }
+    fn new(track: &'a [u8], vel0_notes: [bool; 16]) -> Self {
+        Lookahead { it: smf::events(track), vel0_notes, idx: 0, open: vec![0; 16 * 128], offs: vec![VecDeque::new(); 16 * 128] }
     }
 
     fn step(&mut self) -> Result<bool> {
@@ -281,25 +420,24 @@ impl<'a> Lookahead<'a> {
         let (tick, ev) = e?;
         self.idx += 1;
         if let Ev::Midi(st, key, vel) = ev {
-            if st & 0x0F == self.ch {
-                let k = key as usize & 0x7F;
-                match st & 0xF0 {
-                    0x90 if vel > 0 => self.open[k] += 1,
-                    0x80 | 0x90 if self.open[k] > 0 => {
-                        self.open[k] -= 1;
-                        self.offs[k].push_back(tick);
-                    }
-                    _ => {}
+            let ch = (st & 0x0F) as usize;
+            let k = ch * 128 + (key as usize & 0x7F);
+            match st & 0xF0 {
+                0x90 if vel > 0 || self.vel0_notes[ch] => self.open[k] += 1,
+                0x80 | 0x90 if self.open[k] > 0 => {
+                    self.open[k] -= 1;
+                    self.offs[k].push_back(tick);
                 }
+                _ => {}
             }
         }
         Ok(true)
     }
 
     /// Note-off tick for the note-on that is event number `idx` (1-based) of the track.
-    fn off_for(&mut self, key: u8, idx: u64) -> Result<Option<u64>> {
+    fn off_for(&mut self, ch: u8, key: u8, idx: u64) -> Result<Option<u64>> {
         while self.idx < idx && self.step()? {}
-        let k = key as usize & 0x7F;
+        let k = (ch as usize & 0x0F) * 128 + (key as usize & 0x7F);
         while self.offs[k].is_empty() && self.step()? {}
         Ok(self.offs[k].pop_front())
     }
@@ -307,58 +445,104 @@ impl<'a> Lookahead<'a> {
 
 const FLUSH: usize = 64 * 1024;
 
-fn generate_output(
+/// Write all Domino tracks made from one SMF track, in one pass over it.
+/// The first output goes straight to the main stream; the others (one per
+/// further channel) are built as segments and spliced in after it.
+#[allow(clippy::too_many_arguments)]
+fn generate_track(
     track: &[u8],
-    ch: u8,
-    first: bool,
-    end: u64,
+    scan: &Scan,
+    sizes: &[u32],
+    ppq: u16,
     module: &Module,
-    buf: &mut Vec<u8>,
-    sink: &mut impl Write,
+    sink: &mut pipe::ParSink,
 ) -> Result<()> {
-    let mut la = Lookahead::new(track, ch);
+    let outs = &scan.outs;
+    let mut route = [usize::MAX; 16];
+    let mut vel0 = [false; 16];
+    for (k, o) in outs.iter().enumerate() {
+        route[o.ch as usize] = k;
+        vel0[o.ch as usize] = o.vel0_notes;
+    }
+    let mut bufs: Vec<Vec<u8>> = (0..outs.len()).map(|_| Vec::with_capacity(FLUSH + 4096)).collect();
+    let mut segs: Vec<pipe::Segment> = (1..outs.len()).map(|_| sink.segment()).collect();
+    let flush = |k: usize, buf: &mut Vec<u8>, segs: &mut Vec<pipe::Segment>, sink: &mut pipe::ParSink| -> Result<()> {
+        if k == 0 {
+            sink.write_all(buf)?;
+        } else {
+            sink.write_segment(&mut segs[k - 1], buf)?;
+        }
+        buf.clear();
+        Ok(())
+    };
+    for (k, o) in outs.iter().enumerate() {
+        dms::track_header(&mut bufs[k], sizes[k]);
+        dms::track_head(&mut bufs[k], &scan.name, o.ch, scan.port, false);
+    }
+
+    let mut la = Lookahead::new(track, vel0);
     for (i, e) in smf::events(track).enumerate() {
         let (tick, ev) = e?;
         let pos = tick as u32; // checked in pass 1
-        match ev {
-            Ev::Midi(st, d1, d2) if st & 0x0F == ch => match midi(st, d1, d2, module) {
-                Midi::NoteOn { key, vel } => {
-                    let gate = match la.off_for(key, i as u64 + 1)? {
-                        Some(off) => off - tick,
-                        None => end - tick,
-                    };
-                    dms::note(buf, pos, key, vel, gate.min(MAX_GATE) as u32);
+        let k = match ev {
+            Ev::Midi(st, d1, d2) => {
+                let ch = st & 0x0F;
+                let k = route[ch as usize];
+                let (o, buf) = (&outs[k], &mut bufs[k]);
+                match midi(st, d1, d2, module, o.vel0_notes) {
+                    Midi::NoteOn { key, vel } => {
+                        let gate = match la.off_for(ch, key, i as u64 + 1)? {
+                            Some(off) => off - tick,
+                            None => o.end - tick,
+                        };
+                        dms::note(buf, pos, key, vel, gate.min(MAX_GATE) as u32);
+                    }
+                    Midi::Control { id, gate, value } => dms::control(buf, pos, id, gate as f32, value as f32),
+                    Midi::Program(p) => dms::program(buf, pos, p),
+                    Midi::NoteOff | Midi::Dropped(_) => continue,
                 }
-                Midi::Control { id, gate, value } => dms::control(buf, pos, id, gate as f32, value as f32),
-                Midi::Program(p) => dms::program(buf, pos, p),
-                Midi::NoteOff { .. } | Midi::Dropped(_) => {}
-            },
-            Ev::Midi(..) => {}
-            Ev::Meta(0x02 | 0x03 | 0x20 | 0x21 | 0x2F, _) => {}
-            ev if !first || is_tempo_map(&ev) => {}
-            ev => {
-                let _ = meta_event(buf, &ev, pos);
+                k
             }
-        }
-        if buf.len() >= FLUSH {
-            sink.write_all(buf)?;
-            buf.clear();
+            Ev::Meta(0x02 | 0x03 | 0x20 | 0x21 | 0x2F, _) => continue,
+            ev if is_tempo_map(&ev) => continue,
+            ev => {
+                // Other meta events belong to the first output.
+                let _ = meta_event(&mut bufs[0], &ev, pos);
+                0
+            }
+        };
+        if bufs[k].len() >= FLUSH {
+            flush(k, &mut bufs[k], &mut segs, sink)?;
         }
     }
+    for (k, o) in outs.iter().enumerate() {
+        dms::track_tail(&mut bufs[k], o.end as u32, ppq);
+        flush(k, &mut bufs[k], &mut segs, sink)?;
+    }
+    sink.splice(segs)?;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 
 /// Convert SMF bytes into a complete `.dms` file written to `out`.
-pub fn convert<W: Write + Send>(data: &[u8], module: &Module, out: W) -> Result<(W, Report)> {
-    convert_with(data, module, out, Compression::default(), pipe::BLOCK)
+///
+/// If the file has velocity-0 note-ons, `vel0` is asked how to read them once the
+/// file has been scanned (it is not called otherwise).
+pub fn convert<W: Write + Send>(
+    data: &[u8],
+    module: &Module,
+    out: W,
+    vel0: impl FnOnce(&Vel0Summary) -> Vel0,
+) -> Result<(W, Report)> {
+    convert_with(data, module, out, vel0, Compression::default(), pipe::BLOCK)
 }
 
 pub fn convert_with<W: Write + Send>(
     data: &[u8],
     module: &Module,
     out: W,
+    vel0: impl FnOnce(&Vel0Summary) -> Vel0,
     level: Compression,
     block: usize,
 ) -> Result<(W, Report)> {
@@ -409,6 +593,25 @@ pub fn convert_with<W: Write + Send>(
         report.merge(std::mem::take(&mut s.report));
     }
     cond.sort_unstable_by_key(|c| (c.0, c.1, c.2));
+
+    // Velocity-0 note-ons: summarise both readings and let the caller choose.
+    let regular = |i: usize| !(i == 0 && first_is_conductor);
+    let mut summary = Vel0Summary::default();
+    for (_, s) in scans.iter().enumerate().filter(|(i, _)| regular(*i)) {
+        for o in &s.outs {
+            let [spec, silent] = o.readings;
+            summary.vel0_note_ons += silent.silent;
+            summary.unpaired_as_note_off += spec.unpaired();
+            summary.unpaired_as_silent_note += silent.unpaired();
+            summary.tracks_better_as_silent += (silent.silent > 0 && silent.unpaired() < spec.unpaired()) as usize;
+        }
+    }
+    let vel0 = if summary.vel0_note_ons > 0 { vel0(&summary) } else { Vel0::NoteOff };
+    for (_, s) in scans.iter_mut().enumerate().filter(|(i, _)| regular(*i)) {
+        for o in &mut s.outs {
+            finalize(o, vel0, &mut report)?;
+        }
+    }
     let cond_end = cond.iter().map(|c| c.0).max().unwrap_or(0).max(cond_end);
     let cond_len: u64 = cond.iter().map(|c| c.3.len() as u64).sum();
 
@@ -460,17 +663,15 @@ pub fn convert_with<W: Write + Send>(
             }
         }
         dms::track_tail(&mut buf, cond_end as u32, ppq);
-        let mut size = sizes.iter();
+        sink.write_all(&buf)?;
+        buf.clear();
+        let mut done = 0;
         for (i, s) in scans.iter().enumerate() {
             if i == 0 && first_is_conductor {
                 continue;
             }
-            for (k, o) in s.outs.iter().enumerate() {
-                dms::track_header(&mut buf, *size.next().unwrap());
-                dms::track_head(&mut buf, &s.name, o.ch, s.port, false);
-                generate_output(h.tracks[i], o.ch, k == 0, o.end, module, &mut buf, sink)?;
-                dms::track_tail(&mut buf, o.end as u32, ppq);
-            }
+            generate_track(h.tracks[i], s, &sizes[done..done + s.outs.len()], ppq, module, sink)?;
+            done += s.outs.len();
         }
         dms::song_tail(&mut buf);
         sink.write_all(&buf)?;

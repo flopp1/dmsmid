@@ -5,7 +5,7 @@
 use dmsmid::chunk;
 use dmsmid::module::Module;
 use dmsmid::smf::{self, Event};
-use dmsmid::{envelope, Report};
+use dmsmid::{envelope, Report, Vel0};
 use flate2::Compression;
 use std::io::Cursor;
 
@@ -14,7 +14,11 @@ fn data(name: &str) -> Vec<u8> {
 }
 
 fn to_dms(mid: &[u8]) -> (Vec<u8>, Report) {
-    dmsmid::mid_to_dms(mid, &Module::builtin(), Vec::new()).unwrap()
+    to_dms_vel0(mid, Vel0::NoteOff)
+}
+
+fn to_dms_vel0(mid: &[u8], vel0: Vel0) -> (Vec<u8>, Report) {
+    dmsmid::mid_to_dms(mid, &Module::builtin(), Vec::new(), |_| vel0).unwrap()
 }
 
 fn to_mid(dms: &[u8]) -> (Vec<u8>, Report) {
@@ -61,7 +65,7 @@ fn midi_import_is_identical_with_tiny_compression_blocks() {
     // Many blocks compressed in parallel, each primed with the previous 32 KB.
     let m = Module::builtin();
     let mid = data("probe.mid");
-    let (small, _) = dmsmid::to_dms::convert_with(&mid, &m, Vec::new(), Compression::default(), 997).unwrap();
+    let (small, _) = dmsmid::to_dms::convert_with(&mid, &m, Vec::new(), |_| Vel0::NoteOff, Compression::default(), 997).unwrap();
     let (normal, _) = to_dms(&mid);
     assert_eq!(envelope::decode(&small).unwrap(), envelope::decode(&normal).unwrap());
 }
@@ -189,4 +193,89 @@ fn overlapping_and_unclosed_notes() {
     let tracks = events(&to_mid(&dms).0);
     let offs: Vec<_> = tracks[1].iter().filter(|(_, e)| matches!(e, Event::Midi(m) if m[0] == 0x80)).collect();
     assert_eq!(offs, [&(20, Event::Midi(vec![0x80, 60, 0])), &(40, Event::Midi(vec![0x80, 60, 0])), &(168, Event::Midi(vec![0x80, 64, 0]))]);
+}
+
+/// Black MIDI convention (e.g. Hypernova.mid): every note-on, even with velocity 0,
+/// has its own explicit `8n` note-off. Here one key gets 4 audible and 7 silent
+/// notes at tick 0, all ended by 11 note-offs at tick 1.
+fn silent_note_file() -> Vec<u8> {
+    let mut t = vec![0x00, 0x9F, 64, 4];
+    for v in [2, 1, 1, 0, 0, 0, 0, 0, 0, 0] {
+        t.extend([0x00, 64, v]); // running status
+    }
+    t.extend([0x01, 0x8F, 64, 64]);
+    for _ in 0..10 {
+        t.extend([0x00, 64, 64]);
+    }
+    t.extend([0x00, 0xFF, 0x2F, 0x00]);
+    let mut f = b"MThd\0\0\0\x06\0\0\0\x01\x01\xE0MTrk".to_vec();
+    f.extend((t.len() as u32).to_be_bytes());
+    f.extend(t);
+    f
+}
+
+fn notes_of(dms: &[u8]) -> (Vec<(u64, Event)>, Vec<(u64, Event)>) {
+    let tracks = events(&to_mid(dms).0);
+    let pick = |st: u8| tracks[1].iter().filter(|(_, e)| matches!(e, Event::Midi(m) if m[0] == st)).cloned().collect();
+    (pick(0x9F), pick(0x8F))
+}
+
+#[test]
+fn velocity0_choice_is_offered_with_both_readings() {
+    let mut seen = None;
+    dmsmid::mid_to_dms(&silent_note_file(), &Module::builtin(), Vec::new(), |s| {
+        seen = Some(*s);
+        Vel0::NoteOff
+    })
+    .unwrap();
+    let s = seen.expect("asked");
+    assert_eq!(s.vel0_note_ons, 7);
+    assert_eq!(s.unpaired_as_note_off, 14); // 3 velocity-0 + 11 note-offs match nothing
+    assert_eq!(s.unpaired_as_silent_note, 0);
+    assert_eq!(s.tracks_better_as_silent, 1);
+    assert!(s.ambiguous());
+
+    // An ordinary file using velocity-0 note-ons as note-offs: nothing to decide.
+    let mut probe = None;
+    dmsmid::mid_to_dms(&data("probe.mid"), &Module::builtin(), Vec::new(), |s| {
+        probe = Some(*s);
+        Vel0::NoteOff
+    })
+    .unwrap();
+    assert!(!probe.expect("probe has one velocity-0 note-off").ambiguous());
+}
+
+#[test]
+fn velocity0_as_note_off_is_the_default_reading() {
+    let (dms, report) = to_dms(&silent_note_file());
+    assert_eq!(report.notes, 4);
+    assert_eq!(report.warnings.get("note-off without a matching note-on (ignored)"), Some(&14));
+    let (ons, offs) = notes_of(&dms);
+    assert_eq!(ons.len(), 4);
+    assert!(offs.iter().all(|(t, _)| *t == 0)); // closed by the velocity-0 note-ons
+}
+
+#[test]
+fn velocity0_as_silent_notes() {
+    for mode in [Vel0::SilentNote, Vel0::Auto] {
+        let (dms, report) = to_dms_vel0(&silent_note_file(), mode);
+        assert_eq!(report.notes, 11);
+        assert!(!report.warnings.keys().any(|w| w.contains("without a matching")), "{:?}", report.warnings);
+        assert_eq!(report.warnings.get("velocity-0 note-on read as a silent note"), Some(&7));
+        // Every note lasts 1 tick and the original structure survives the round trip.
+        let (ons, offs) = notes_of(&dms);
+        assert_eq!(ons.len(), 11);
+        assert!(ons.iter().all(|(t, _)| *t == 0));
+        assert_eq!(ons.iter().filter(|(_, e)| matches!(e, Event::Midi(m) if m[2] == 0)).count(), 7);
+        assert_eq!(offs.len(), 11);
+        assert!(offs.iter().all(|(t, _)| *t == 1));
+    }
+}
+
+#[test]
+fn auto_reads_each_track_on_its_own() {
+    // probe.mid uses a velocity-0 note-on as a note-off: auto must keep that reading
+    // there, so the output still equals Domino's import.
+    let (auto, _) = to_dms_vel0(&data("probe.mid"), Vel0::Auto);
+    assert_same_dms(&envelope::decode(&auto).unwrap(), &envelope::decode(&data("probe.dms")).unwrap());
 }

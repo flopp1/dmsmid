@@ -450,11 +450,9 @@ fn note<W: Write + Seek>(
     report: &mut Report,
 ) -> Result<()> {
     let key = (key & 0x7F) as u8;
-    let mut vel = vel.unwrap_or(100).min(127) as u8;
-    if vel == 0 {
-        vel = 1;
-        report.warn("note velocity 0 raised to 1");
-    }
+    // Velocity 0 is a silent note (see to_dms::Pairing): written as a velocity-0
+    // note-on with its own note-off, exactly as such files store it.
+    let vel = vel.unwrap_or(100).min(127) as u8;
     let pos = em.advance(w, pos, report)?;
     em.write(w, pos, &[0x90 | ch, key, vel])?;
     em.note_off(pos + gate as u64, 0x80 | ch, key);
