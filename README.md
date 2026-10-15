@@ -8,7 +8,11 @@ Run `dmsmid.exe` and pick one or more files in the dialog. Each file is identifi
 dmsmid song.mid other.dms
 dmsmid --module "C:\...\Domino64Bit\Module\ok_XG2k.xml" song.mid
 dmsmid --vel0 silent song.mid
+dmsmid --split measure --split-size 1000000000 huge.mid
+dmsmid --track-split 16 huge.mid
 ```
+
+A progress bar shows each step on the console. Its timer stops while a question is waiting for your answer.
 
 ## Behaviour (matches Domino's own import/export; see tests/domino.rs)
 
@@ -31,6 +35,34 @@ When a MIDI file contains velocity-0 note-ons and the two readings disagree, dms
 3. **auto**: whichever reading fits better, decided per track.
 
 `--vel0 note-off|silent|auto` answers the question in advance. Ordinary files, where both readings agree, are never asked about. Silent notes keep velocity 0 in the `.dms`, and converting back writes them the same way, so a round trip preserves them.
+
+## Splitting songs too large for one .dms file
+
+A `.dms` file can hold at most 4,294,967,295 bytes uncompressed (its size field is 32-bit), which is about 100 million notes. A larger MIDI file can be split into several `.dms` files, named `song (part 1 of 3).dms` and so on. You are asked how, or you can choose in advance:
+
+| `--split` | How |
+|---|---|
+| `measure` | By time: each file ends at the last whole measure that fits. A measure too big for one file is cut by tick, up to the next measure that fits. |
+| `tick` | By time: each file ends exactly where it would overflow. |
+| `track` | By track, whole tracks only. A track too big for one file by itself is cut by time into files of its own. |
+| `track-partial` | By track, packing every file full: the track at each file boundary is cut by time. |
+
+- **Time-based parts** contain every track. Each part's conductor holds the global events inside its span, plus the tempo, time signature and key signature in effect at its start, so every part plays and shows bars correctly on its own.
+- **Global events** are tempo, time signatures and key signatures (from any track), plus markers, text, lyrics and cue points on the conductor track (MIDI track 0).
+- **Channel state is carried.** A track piece that starts mid-song (any time-based part, or a track cut in the track-based methods) begins with the track's last value of every controller, plus program change, pitch bend and pressure, replayed in their original order (RPN/NRPN selections before their data entry, bank select before program change). Momentary commands are not replayed: data increment/decrement (CC 96/97), all sound off (120) and all notes off / mode messages (123–127).
+- **Track-based splits** use the tracks *after* multi-channel tracks have been separated.
+- **Other options:**
+  - `--split-offset keep|remove` (default `keep`): whether a part that starts later in the song keeps its position or is moved to start at 0.
+  - `--split-cut measure|tick` (default `measure`): how the track-based methods cut a track.
+
+  Each of these is asked on the console when it's needed and not given.
+- **`--split-size BYTES`** sets a smaller limit. It defaults to the format's maximum, and larger values are rejected.
+
+### Splitting by track count
+
+`--track-split N` writes one `.dms` per N tracks, counted after multi-channel tracks have been separated: `song (Track 1-16).dms`, `song (Track 17-32).dms`, and so on; a last group of one track is named `song (Track 33).dms`. Every file gets all global events (the whole conductor). If a file would still be too large, it is split with the options above, chosen once for all such files, and named `song (Track 17-32, part 1 of 2).dms`.
+
+Splitting applies only to MIDI → `.dms`; `.dms` → MIDI never splits. On Hypernova (60 M notes, 2.6 GB as `.dms`), a 1 GB split takes 10–19 s depending on the method, with under 50 MB of memory.
 
 ## Performance
 

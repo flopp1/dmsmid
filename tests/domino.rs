@@ -5,7 +5,7 @@
 use dmsmid::chunk;
 use dmsmid::module::Module;
 use dmsmid::smf::{self, Event};
-use dmsmid::{envelope, Report, Vel0};
+use dmsmid::{envelope, Answers, Choices, Options, Progress, Report, SplitMethod, TimeCut, Vel0, Vel0Summary};
 use flate2::Compression;
 use std::io::Cursor;
 
@@ -18,12 +18,39 @@ fn to_dms(mid: &[u8]) -> (Vec<u8>, Report) {
 }
 
 fn to_dms_vel0(mid: &[u8], vel0: Vel0) -> (Vec<u8>, Report) {
-    dmsmid::mid_to_dms(mid, &Module::builtin(), Vec::new(), |_| vel0).unwrap()
+    let (mut files, r) = convert(mid, &Options::default(), &mut Answers { vel0, ..Answers::default() }).unwrap();
+    assert_eq!(files.len(), 1);
+    (files.pop().unwrap(), r)
+}
+
+/// MIDI -> one or more .dms files.
+fn convert(mid: &[u8], opts: &Options, choices: &mut dyn Choices) -> anyhow::Result<(Vec<Vec<u8>>, Report)> {
+    dmsmid::mid_to_dms(mid, &Module::builtin(), opts, choices, |_| Ok(Vec::new()), &Progress::default())
 }
 
 fn to_mid(dms: &[u8]) -> (Vec<u8>, Report) {
-    let (out, r) = dmsmid::dms_to_mid(dms, &Module::builtin(), Cursor::new(Vec::new())).unwrap();
+    let (out, r) = dmsmid::dms_to_mid(dms, &Module::builtin(), Cursor::new(Vec::new()), &Progress::default()).unwrap();
     (out.into_inner(), r)
+}
+
+/// Records the velocity-0 summary it is shown.
+#[derive(Default)]
+struct Spy(Option<Vel0Summary>);
+
+impl Choices for Spy {
+    fn vel0(&mut self, s: &Vel0Summary) -> Vel0 {
+        self.0 = Some(*s);
+        Vel0::NoteOff
+    }
+    fn split(&mut self, _: u64, _: u64) -> Option<SplitMethod> {
+        None
+    }
+    fn keep_offset(&mut self) -> bool {
+        true
+    }
+    fn partial_cut(&mut self) -> TimeCut {
+        TimeCut::Measure
+    }
 }
 
 /// Root chunks, with root 1013 (editor state; Domino writes varying values) removed.
@@ -63,11 +90,11 @@ fn midi_import_matches_domino_byte_for_byte() {
 #[test]
 fn midi_import_is_identical_with_tiny_compression_blocks() {
     // Many blocks compressed in parallel, each primed with the previous 32 KB.
-    let m = Module::builtin();
     let mid = data("probe.mid");
-    let (small, _) = dmsmid::to_dms::convert_with(&mid, &m, Vec::new(), |_| Vel0::NoteOff, Compression::default(), 997).unwrap();
+    let opts = Options { block: 997, level: Compression::default(), ..Options::default() };
+    let (small, _) = convert(&mid, &opts, &mut Answers::default()).unwrap();
     let (normal, _) = to_dms(&mid);
-    assert_eq!(envelope::decode(&small).unwrap(), envelope::decode(&normal).unwrap());
+    assert_eq!(envelope::decode(&small[0]).unwrap(), envelope::decode(&normal).unwrap());
 }
 
 /// Events per track, key signatures excluded (Domino moves them to bar starts on export).
@@ -149,10 +176,10 @@ fn damaged_files_are_rejected() {
     let dms = data("probe.dms");
     let m = Module::builtin();
     let truncated = &dms[..dms.len() / 2];
-    assert!(dmsmid::dms_to_mid(truncated, &m, Cursor::new(Vec::new())).is_err());
+    assert!(dmsmid::dms_to_mid(truncated, &m, Cursor::new(Vec::new()), &Progress::default()).is_err());
     let mut wrong_size = dms.clone();
     wrong_size[18] ^= 1;
-    assert!(dmsmid::dms_to_mid(&wrong_size, &m, Cursor::new(Vec::new())).is_err());
+    assert!(dmsmid::dms_to_mid(&wrong_size, &m, Cursor::new(Vec::new()), &Progress::default()).is_err());
 }
 
 #[test]
@@ -222,13 +249,9 @@ fn notes_of(dms: &[u8]) -> (Vec<(u64, Event)>, Vec<(u64, Event)>) {
 
 #[test]
 fn velocity0_choice_is_offered_with_both_readings() {
-    let mut seen = None;
-    dmsmid::mid_to_dms(&silent_note_file(), &Module::builtin(), Vec::new(), |s| {
-        seen = Some(*s);
-        Vel0::NoteOff
-    })
-    .unwrap();
-    let s = seen.expect("asked");
+    let mut spy = Spy::default();
+    convert(&silent_note_file(), &Options::default(), &mut spy).unwrap();
+    let s = spy.0.expect("asked");
     assert_eq!(s.vel0_note_ons, 7);
     assert_eq!(s.unpaired_as_note_off, 14); // 3 velocity-0 + 11 note-offs match nothing
     assert_eq!(s.unpaired_as_silent_note, 0);
@@ -236,13 +259,9 @@ fn velocity0_choice_is_offered_with_both_readings() {
     assert!(s.ambiguous());
 
     // An ordinary file using velocity-0 note-ons as note-offs: nothing to decide.
-    let mut probe = None;
-    dmsmid::mid_to_dms(&data("probe.mid"), &Module::builtin(), Vec::new(), |s| {
-        probe = Some(*s);
-        Vel0::NoteOff
-    })
-    .unwrap();
-    assert!(!probe.expect("probe has one velocity-0 note-off").ambiguous());
+    let mut probe = Spy::default();
+    convert(&data("probe.mid"), &Options::default(), &mut probe).unwrap();
+    assert!(!probe.0.expect("probe has one velocity-0 note-off").ambiguous());
 }
 
 #[test]

@@ -10,6 +10,7 @@ use crate::dms::*;
 use crate::envelope;
 use crate::module::{Expansion, Module, ID_CHANNEL_PRESSURE, ID_PITCH_BEND};
 use crate::pipe::{self, BlockSource};
+use crate::progress::Progress;
 use crate::smf;
 use crate::Report;
 use anyhow::{bail, Context, Result};
@@ -18,7 +19,7 @@ use std::collections::BinaryHeap;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::sync::mpsc::sync_channel;
 
-pub fn convert<W: Write + Seek>(file: &[u8], module: &Module, out: W) -> Result<(W, Report)> {
+pub fn convert<W: Write + Seek>(file: &[u8], module: &Module, out: W, progress: &Progress) -> Result<(W, Report)> {
     let Some(magic) = envelope::magic_of(file) else { bail!("not Domino data (unknown header)") };
     let Some(size) = file.get(magic.len()..magic.len() + 4) else { bail!("file is truncated") };
     let size = u32::from_le_bytes(size.try_into().unwrap()) as u64;
@@ -27,7 +28,8 @@ pub fn convert<W: Write + Seek>(file: &[u8], module: &Module, out: W) -> Result<
     std::thread::scope(|s| {
         let (tx, rx) = sync_channel(4);
         let (recycle_tx, recycle_rx) = sync_channel(6);
-        s.spawn(move || pipe::inflate(zlib, size, tx, recycle_rx));
+        progress.start("Converting", zlib.len() as u64);
+        s.spawn(move || pipe::inflate(zlib, size, tx, recycle_rx, progress));
         let mut src = BlockSource::new(rx, recycle_tx);
         let r = write_song(&mut src, size, module, out);
         if r.is_ok() {

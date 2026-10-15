@@ -57,6 +57,11 @@ pub fn events(track: &[u8]) -> Events<'_> {
 }
 
 impl<'a> Events<'a> {
+    /// Bytes of the track consumed so far.
+    pub fn offset(&self) -> usize {
+        self.p
+    }
+
     #[inline]
     fn byte(&mut self) -> Result<u8> {
         match self.b.get(self.p) {

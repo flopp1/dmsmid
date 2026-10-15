@@ -4,6 +4,7 @@
 //!   plus out-of-order [`Segment`]s spliced in later.
 
 use anyhow::{anyhow, bail, Result};
+use crate::progress::Progress;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
@@ -22,9 +23,16 @@ const DICT: usize = 32 * 1024;
 /// Decompress `zlib` (a complete zlib stream, possibly followed by padding) into
 /// blocks sent over `tx`. Blocks come back through `recycle` so only a fixed
 /// number ever exist. Checks that exactly `expected` bytes come out.
-pub fn inflate(zlib: &[u8], expected: u64, tx: SyncSender<Result<Vec<u8>>>, recycle: Receiver<Vec<u8>>) {
+pub fn inflate(
+    zlib: &[u8],
+    expected: u64,
+    tx: SyncSender<Result<Vec<u8>>>,
+    recycle: Receiver<Vec<u8>>,
+    progress: &Progress,
+) {
     let mut d = Decompress::new(true);
     let mut total = 0u64;
+    let mut reported = 0u64;
     loop {
         let mut buf = recycle.try_recv().unwrap_or_default();
         buf.clear();
@@ -51,6 +59,8 @@ pub fn inflate(zlib: &[u8], expected: u64, tx: SyncSender<Result<Vec<u8>>>, recy
             }
         }
         total += buf.len() as u64;
+        progress.add(d.total_in() - reported);
+        reported = d.total_in();
         if total > expected {
             let _ = tx.send(Err(anyhow!("unpacked size mismatch: header says {expected}, got more")));
             return;

@@ -5,7 +5,9 @@ pub mod dms;
 pub mod envelope;
 pub mod module;
 pub mod pipe;
+pub mod progress;
 pub mod smf;
+mod split;
 pub mod to_dms;
 pub mod to_mid;
 
@@ -56,20 +58,29 @@ pub fn detect(data: &[u8]) -> Option<Kind> {
     }
 }
 
-/// `.dms`/`.dmp` file bytes → `.mid` written to `out`.
-pub fn dms_to_mid<W: Write + Seek>(file: &[u8], module: &module::Module, out: W) -> anyhow::Result<(W, Report)> {
-    to_mid::convert(file, module, out)
-}
-
-pub use to_dms::{Vel0, Vel0Summary};
-
-/// `.mid` file bytes → `.dms` written to `out`. `vel0` chooses how velocity-0
-/// note-ons are read; it is only called if the file has any.
-pub fn mid_to_dms<W: Write + Send>(
+/// `.dms`/`.dmp` file bytes → `.mid` written to `out`. Never split.
+pub fn dms_to_mid<W: Write + Seek>(
     file: &[u8],
     module: &module::Module,
     out: W,
-    vel0: impl FnOnce(&Vel0Summary) -> Vel0,
+    progress: &progress::Progress,
 ) -> anyhow::Result<(W, Report)> {
-    to_dms::convert(file, module, out, vel0)
+    to_mid::convert(file, module, out, progress)
+}
+
+pub use progress::Progress;
+pub use to_dms::{Answers, Choices, FilePlan, Options, SplitMethod, TimeCut, Vel0, Vel0Summary, MAX_UNPACKED};
+
+/// `.mid` file bytes → one or more `.dms` files. `open` supplies the writer for each
+/// file; there is one file unless the song is too large for `opts.split_size` (and
+/// `choices` picks a way to split it) or `opts.track_split` is set.
+pub fn mid_to_dms<W: Write + Send>(
+    file: &[u8],
+    module: &module::Module,
+    opts: &Options,
+    choices: &mut dyn Choices,
+    open: impl FnMut(&FilePlan) -> anyhow::Result<W>,
+    progress: &progress::Progress,
+) -> anyhow::Result<(Vec<W>, Report)> {
+    to_dms::convert(file, module, opts, choices, open, progress)
 }
